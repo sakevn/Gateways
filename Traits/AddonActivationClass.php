@@ -25,7 +25,7 @@ trait AddonActivationClass
                     'route' => $route
                 ];
             }
-
+/*
             $post = [
                 base64_decode('dXNlcm5hbWU=') => $info['username'],//un
                 base64_decode('cHVyY2hhc2Vfa2V5') => $info['purchase_code'],//pk
@@ -42,7 +42,7 @@ trait AddonActivationClass
             } catch (\Exception $exception) {
                 $response = 1;
             }
-
+*/
             if (!$response) {
                 $info = include('Modules/Gateways/Addon/info.php');
                 $info['is_published'] = 0;
