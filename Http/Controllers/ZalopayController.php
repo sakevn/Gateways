@@ -2,32 +2,29 @@
 
 namespace Modules\Gateways\Http\Controllers;
 
-use Illuminate\Foundation\Application;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
-use Illuminate\Routing\Redirector;
 use Illuminate\Support\Facades\Redirect;
 use Illuminate\Support\Facades\Validator;
 use Modules\Gateways\Traits\Processor;
 use Modules\Gateways\Entities\PaymentRequest;
 
-class VivaWalletController extends Controller
+class ZalopayController extends Controller
 {
     use Processor;
 
     private mixed $config_values;
-    private $client_id;
-    private $client_secret;
-    private $source_code;
-    private string $token;
+    private $app_id;
+    private $key1;
+    private $key2;
     private string $config_mode;
     private PaymentRequest $payment;
 
     public function __construct(PaymentRequest $payment)
     {
-        $config = $this->payment_config('viva_wallet', 'payment_config');
+        $config = $this->payment_config('zalopay', 'payment_config');
         if (!is_null($config) && $config->mode == 'live') {
             $this->config_values = json_decode($config->live_values);
         } elseif (!is_null($config) && $config->mode == 'test') {
@@ -35,40 +32,13 @@ class VivaWalletController extends Controller
         }
 
         if ($config) {
-            $this->client_id = $this->config_values->client_id;
-            $this->client_secret = $this->config_values->client_secret;
-            $this->source_code = $this->config_values->source_code;
+            $this->app_id = $this->config_values->app_id;
+            $this->key1 = $this->config_values->key1;
+            $this->key2 = $this->config_values->key2;
             $this->config_mode = ($config->mode == 'test') ? 'test' : 'live';
-            $this->token = base64_encode($this->client_id . ':' . $this->client_secret);
         }
 
         $this->payment = $payment;
-    }
-
-    public function credential_check(): bool|string
-    {
-        if ($this->config_mode == 'test') {
-            $token_url = 'https://demo-accounts.vivapayments.com/connect/token';
-        } else {
-            $token_url = 'https://accounts.vivapayments.com/connect/token';
-        }
-        $curl = curl_init();
-
-        curl_setopt($curl, CURLOPT_URL, $token_url);
-        curl_setopt($curl, CURLOPT_RETURNTRANSFER, 1);
-        curl_setopt($curl, CURLOPT_POST, 1);
-        curl_setopt($curl, CURLOPT_POSTFIELDS, "grant_type=client_credentials");
-
-        $headers = array(
-            'Content-Type: application/x-www-form-urlencoded',
-            'Authorization: Basic ' . $this->token
-        );
-        curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
-
-        $accessToken = curl_exec($curl);
-
-        curl_close($curl);
-        return $accessToken;
     }
 
     public function payment(Request $req)
@@ -88,116 +58,61 @@ class VivaWalletController extends Controller
 
         $payer = json_decode($payment_data['payer_information']);
 
-        if ($this->config_mode == 'test') {
+        $order_url = $this->config_mode == 'test' ? 'https://sandbox.zalopay.vn/v001/tpe/createorder' : 'https://sb-openapi.zalopay.vn/v2/create';
+        $redirect_url = $this->config_mode == 'test' ? 'https://sandbox.zalopay.vn/checkout' : 'https://zalopay.vn/checkout';
 
-            $order_code_url = 'https://demo-api.vivapayments.com/checkout/v2/orders';
-            $transcation_url = 'https://demo.vivapayments.com/web/checkout?ref=';
+        $order = [
+            'app_id' => $this->app_id,
+            'app_trans_id' => date("ymd") . '_' . $payment_data->id, // translation ID
+            'app_user' => $payer->email,
+            'amount' => $payment_data->payment_amount * 1000, // amount in VND
+            'app_time' => round(microtime(true) * 1000), // miliseconds
+            'item' => 'Payment for order ' . $payment_data->id,
+            'embed_data' => json_encode(['redirecturl' => route('zalopay.callback')]),
+            'mac' => hash_hmac('sha256', $this->app_id . "|" . $payment_data->id . "|" . ($payment_data->payment_amount * 1000) . "|" . round(microtime(true) * 1000) . "|" . $payer->email, $this->key1)
+        ];
 
+        $response = $this->sendRequest($order_url, $order);
+
+        if ($response && $response->return_code == 1) {
+            return Redirect::away($redirect_url . '?order_token=' . $response->order_token);
         } else {
-            $order_code_url = 'https://api.vivapayments.com/checkout/v2/orders';
-            $transcation_url = 'https://www.vivapayments.com/web/checkout?ref=';
+            return response()->json($this->response_formatter(GATEWAYS_DEFAULT_400, null, $response->return_message), 400);
         }
-
-        $accessToken = json_decode($this->credential_check(), true);
-
-        if (isset($accessToken['access_token'])) {
-
-            try {
-                $accessToken = $accessToken['access_token'];
-                $amount = round($payment_data->payment_amount * 100, 2);
-                $bill_amount = round($payment_data->payment_amount, 2);
-                $postFields = [
-                    'amount' => $amount,
-                    'customerTrns' => 'trx-' . $bill_amount,
-                    'customer' => [
-                        'email' => $payer->email,
-                        'fullName' => $payer->name,
-                        'phone' => $payer->phone,
-                        'countryCode' => 'UK',
-                        'requestLang' => 'en'
-                    ],
-                    'paymentTimeout' => 1800,
-                    'preauth' => false,
-                    'allowRecurring' => true,
-                    'maxInstallments' => 0,
-                    'paymentNotification' => true,
-                    'disableExactAmount' => false,
-                    'disableCash' => false,
-                    'disableWallet' => false,
-                    'sourceCode' => $this->source_code ?? 'Default',
-                    'merchantTrns' => $payment_data->attribute_id,
-                ];
-
-                $curl = curl_init();
-                curl_setopt_array($curl, array(
-                    CURLOPT_URL => $order_code_url,
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_ENCODING => '',
-                    CURLOPT_MAXREDIRS => 10,
-                    CURLOPT_TIMEOUT => 0,
-                    CURLOPT_FOLLOWLOCATION => true,
-                    CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-                    CURLOPT_CUSTOMREQUEST => 'POST',
-                    CURLOPT_POSTFIELDS => json_encode($postFields),
-                    CURLOPT_HTTPHEADER => array(
-                        "Authorization: Bearer $accessToken",
-                        'Content-Type: application/json'
-                    ),
-                ));
-
-                $response = curl_exec($curl);
-
-                curl_close($curl);
-                $data = json_decode($response);
-
-                $this->payment::where(['id' => $req['payment_id']])->update([
-                    'transaction_id' => $data->orderCode,
-                ]);
-
-                return Redirect::away($transcation_url . $data->orderCode);
-            } catch (\Exception $ex) {
-
-            }
-        } else {
-            return response()->json($this->response_formatter(GATEWAYS_DEFAULT_204), 200);
-        }
-        return 0;
     }
 
-    public function success(Request $request)
+    public function callback(Request $request)
     {
-        $transcation = $request->t;
-        $order_code = $request->s;
-
-        if ($transcation && $order_code) {
-            $this->payment::where(['transaction_id' => $order_code])->update([
-                'payment_method' => 'viva_wallet',
+        $data = $request->all();
+        $mac = hash_hmac('sha256', $data['data'], $this->key2);
+        if ($mac === $data['mac']) {
+            $this->payment::where(['transaction_id' => $data['app_trans_id']])->update([
+                'payment_method' => 'zalopay',
                 'is_paid' => 1,
-                'transaction_id' => $transcation,
+                'transaction_id' => $data['app_trans_id'],
             ]);
 
-            $data = $this->payment::where(['transaction_id' => $transcation])->first();
+            $data = $this->payment::where(['transaction_id' => $data['app_trans_id']])->first();
 
             if (isset($data) && function_exists($data->success_hook)) {
                 call_user_func($data->success_hook, $data);
             }
 
             return $this->payment_response($data, 'success');
+        } else {
+            return response()->json($this->response_formatter(GATEWAYS_DEFAULT_400, null, 'Invalid MAC'), 400);
         }
-
-        return 0;
     }
 
-    public function fail(Request $request): Application|JsonResponse|int|Redirector|RedirectResponse|\Illuminate\Contracts\Foundation\Application
+    private function sendRequest($url, $data)
     {
-        $order_code = $request->s;
-        if ($order_code) {
-            $payment_data = $this->payment::where(['transaction_id' => $order_code])->first();
-            if (isset($payment_data) && function_exists($payment_data->failure_hook)) {
-                call_user_func($payment_data->failure_hook, $payment_data);
-            }
-            return $this->payment_response($payment_data, 'fail');
-        }
-        return 0;
+        $curl = curl_init($url);
+        curl_setopt($curl, CURLOPT_POST, true);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($data));
+        $response = curl_exec($curl);
+        curl_close($curl);
+        return json_decode($response);
     }
 }
